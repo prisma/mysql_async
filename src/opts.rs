@@ -698,7 +698,8 @@ impl Opts {
             | CapabilityFlags::CLIENT_MULTI_RESULTS
             | CapabilityFlags::CLIENT_PS_MULTI_RESULTS
             | CapabilityFlags::CLIENT_DEPRECATE_EOF
-            | CapabilityFlags::CLIENT_PLUGIN_AUTH;
+            | CapabilityFlags::CLIENT_PLUGIN_AUTH
+            | CapabilityFlags::CLIENT_FOUND_ROWS;
 
         if self.inner.mysql_opts.db_name.is_some() {
             out |= CapabilityFlags::CLIENT_CONNECT_WITH_DB;
