@@ -19,6 +19,7 @@ use mysql_common::{
         OldEofPacket, ResultSetTerminator, SslRequest,
     },
     proto::MySerialize,
+    row::Row,
 };
 
 use std::{
@@ -894,22 +895,24 @@ impl Conn {
         let read_max_allowed_packet = self.opts().max_allowed_packet().is_none();
         let read_wait_timeout = self.opts().wait_timeout().is_none();
 
-        let settings: Option<(Option<String>, Option<usize>, Option<usize>)> =
-            if read_socket || read_max_allowed_packet || read_wait_timeout {
-                self.query_internal("SELECT @@socket, @@max_allowed_packet, @@wait_timeout")
-                    .await?
-            } else {
-                None
-            };
+        let settings: Option<Row> = if read_socket || read_max_allowed_packet || read_wait_timeout {
+            self.query_internal("SELECT @@socket, @@max_allowed_packet, @@wait_timeout")
+                .await?
+        } else {
+            None
+        };
 
         // set socket inside the connection
         if read_socket {
-            self.inner.socket = settings.as_ref().map(|s| s.0.to_owned()).unwrap_or(None);
+            self.inner.socket = settings.as_ref().map(|s| s.get("@@socket")).unwrap_or(None);
         }
 
         // set max_allowed_packet
         let max_allowed_packet = if read_max_allowed_packet {
-            settings.as_ref().map(|s| s.1).unwrap()
+            settings
+                .as_ref()
+                .map(|s| s.get("@@max_allowed_packet"))
+                .unwrap()
         } else {
             self.opts().max_allowed_packet()
         };
@@ -919,7 +922,7 @@ impl Conn {
 
         // set read_wait_timeout
         let wait_timeout = if read_wait_timeout {
-            settings.as_ref().map(|s| s.2).unwrap()
+            settings.as_ref().map(|s| s.get("@@wait_timeout")).unwrap()
         } else {
             self.opts().wait_timeout()
         };
