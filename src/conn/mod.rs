@@ -374,6 +374,11 @@ impl Conn {
         self.inner.version
     }
 
+    /// Returns whether the server is MariaDB.
+    pub fn is_mariadb(&self) -> bool {
+        self.inner.is_mariadb
+    }
+
     /// Returns connection options.
     pub fn opts(&self) -> &Opts {
         &self.inner.opts
