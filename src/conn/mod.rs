@@ -60,6 +60,9 @@ pub mod stmt_cache;
 lazy_static::lazy_static! {
     static ref FIXED_MARIADB_VERSION_RE: Regex =
         Regex::new(r"^(?:5.5.5-)?(\d{1,2})\.(\d{1,2})\.(\d{1,3})-MariaDB").unwrap();
+
+    static ref VITESS_VERSION_RE: Regex =
+        Regex::new(r"^(\d+)\.(\d+)\.(\d+)-[Vv]itess").unwrap();
 }
 
 /// Helper that asynchronously disconnects the givent connection on the default tokio executor.
@@ -101,6 +104,7 @@ struct ConnInner {
     stream: Option<Stream>,
     id: u32,
     is_mariadb: bool,
+    is_vitess: bool,
     version: (u16, u16, u16),
     socket: Option<String>,
     capabilities: CapabilityFlags,
@@ -148,6 +152,7 @@ impl ConnInner {
             last_err_packet: None,
             stream: None,
             is_mariadb: false,
+            is_vitess: false,
             version: (0, 0, 0),
             id: 0,
             pending_result: Ok(None),
@@ -386,6 +391,11 @@ impl Conn {
         self.inner.is_mariadb
     }
 
+    /// Returns whether the server is Vitess.
+    pub fn is_vitess(&self) -> bool {
+        self.inner.is_vitess
+    }
+
     /// Returns connection options.
     pub fn opts(&self) -> &Opts {
         &self.inner.opts
@@ -478,9 +488,10 @@ impl Conn {
         self.inner.capabilities = handshake.capabilities() & self.inner.opts.get_capabilities();
         self.inner.version =
             Self::fixed_maria_db_server_version_parsed(handshake.server_version_ref())
-                .map(|version| {
-                    self.inner.is_mariadb = true;
-                    version
+                .inspect(|_| self.inner.is_mariadb = true)
+                .or_else(|| {
+                    Self::vitess_server_version_parsed(handshake.server_version_ref())
+                        .inspect(|_| self.inner.is_vitess = true)
                 })
                 .or_else(|| handshake.server_version_parsed())
                 .unwrap_or((0, 0, 0));
@@ -507,9 +518,19 @@ impl Conn {
         FIXED_MARIADB_VERSION_RE.captures(version).map(|captures| {
             // Should not panic because validated with regex
             (
-                lexical::parse::<u16, _>(captures.get(1).unwrap().as_bytes()).unwrap(),
-                lexical::parse::<u16, _>(captures.get(2).unwrap().as_bytes()).unwrap(),
-                lexical::parse::<u16, _>(captures.get(3).unwrap().as_bytes()).unwrap(),
+                lexical::parse(captures.get(1).unwrap().as_bytes()).unwrap(),
+                lexical::parse(captures.get(2).unwrap().as_bytes()).unwrap(),
+                lexical::parse(captures.get(3).unwrap().as_bytes()).unwrap(),
+            )
+        })
+    }
+
+    pub fn vitess_server_version_parsed(version: &[u8]) -> Option<(u16, u16, u16)> {
+        VITESS_VERSION_RE.captures(version).map(|captures| {
+            (
+                lexical::parse(captures.get(1).unwrap().as_bytes()).unwrap(),
+                lexical::parse(captures.get(2).unwrap().as_bytes()).unwrap(),
+                lexical::parse(captures.get(3).unwrap().as_bytes()).unwrap(),
             )
         })
     }
