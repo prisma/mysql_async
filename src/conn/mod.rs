@@ -942,8 +942,15 @@ impl Conn {
         let read_max_allowed_packet = self.opts().max_allowed_packet().is_none();
         let read_wait_timeout = self.opts().wait_timeout().is_none();
 
-        let settings: Option<Row> = if read_socket || read_max_allowed_packet || read_wait_timeout {
-            self.query_internal("SELECT @@socket, @@max_allowed_packet, @@wait_timeout")
+        let query_marks = [read_socket, read_max_allowed_packet, read_wait_timeout];
+        let query_variables: Vec<&str> = ["@@socket", "@@max_allowed_packet", "@@wait_timeout"].iter()
+                                                                                         .enumerate()
+                                                                                         .filter(|&(i, _)| query_marks[i])
+                                                                                         .map(|(_, &x)| x)
+                                                                                         .collect();
+
+        let settings: Option<Row> = if query_variables.len() > 0 {
+            self.query_internal(format!("SELECT {}", query_variables.join(", ")).to_string())
                 .await?
         } else {
             None
