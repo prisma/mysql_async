@@ -124,21 +124,21 @@ where
 
         if columns.is_empty() {
             // Empty, but not yet consumed result set.
-            self.conn.set_pending_result(None)?;
+            self.conn.as_mut().set_pending_result(None)?;
         } else {
             // Not yet consumed non-empty result set.
-            let packet = match self.conn.read_packet().await {
+            let packet = match self.conn.as_mut().read_packet().await {
                 Ok(packet) => packet,
                 Err(err) => {
                     // Next row contained an error. No more data will follow.
-                    self.conn.set_pending_result(None)?;
+                    self.conn.as_mut().set_pending_result(None)?;
                     return Err(err);
                 }
             };
 
             if P::is_last_result_set_packet(self.conn.capabilities(), &packet) {
                 // `packet` is a result set terminator.
-                self.conn.set_pending_result(None)?;
+                self.conn.as_mut().set_pending_result(None)?;
             } else {
                 // `packet` is a result set row.
                 row = Some(P::read_result_set_row(&packet, columns)?);
@@ -154,7 +154,10 @@ where
     async fn next_set(&mut self) -> crate::Result<bool> {
         if self.conn.more_results_exists() {
             // More data will follow.
-            self.conn.routine(NextSetRoutine::<P>::new()).await?;
+            self.conn
+                .as_mut()
+                .routine(NextSetRoutine::<P>::new())
+                .await?;
         }
         Ok(self.conn.has_pending_result())
     }
@@ -174,23 +177,23 @@ where
         columns: Arc<[Column]>,
     ) -> crate::Result<Option<Row>> {
         if let Some(row) = self.next_row(columns).await? {
-            return Ok(Some(row));
+            Ok(Some(row))
         } else {
             self.next_set().await?;
-            return Ok(None);
+            Ok(None)
         }
     }
 
     /// Skips the taken result set.
     async fn skip_taken(&mut self, meta: Arc<ResultSetMeta>) -> crate::Result<()> {
-        while let Some(_) = self.next_row_or_next_set((*meta).clone()).await? {}
+        while (self.next_row_or_next_set((*meta).clone()).await?).is_some() {}
         Ok(())
     }
 
     #[doc(hidden)]
     pub async fn next(&mut self) -> Result<Option<Row>> {
         loop {
-            match self.conn.use_pending_result()?.cloned() {
+            match self.conn.as_mut().use_pending_result()?.cloned() {
                 Some(PendingResult::Pending(meta)) => return self.next_row_or_next_set(meta).await,
                 Some(PendingResult::Taken(meta)) => self.skip_taken(meta).await?,
                 None => return Ok(None),

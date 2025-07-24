@@ -7,15 +7,14 @@
 // modified, or distributed except according to those terms.
 
 use futures_util::FutureExt;
-use priority_queue::PriorityQueue;
+use keyed_priority_queue::KeyedPriorityQueue;
 use tokio::sync::mpsc;
 
 use std::{
-    cmp::{Ordering, Reverse},
+    borrow::Borrow,
+    cmp::Reverse,
     collections::VecDeque,
-    convert::TryFrom,
     hash::{Hash, Hasher},
-    pin::Pin,
     str::FromStr,
     sync::{atomic, Arc, Mutex},
     task::{Context, Poll, Waker},
@@ -26,12 +25,15 @@ use crate::{
     conn::{pool::futures::*, Conn},
     error::*,
     opts::{Opts, PoolOpts},
-    queryable::transaction::{Transaction, TxOpts, TxStatus},
+    queryable::transaction::{Transaction, TxOpts},
 };
+
+pub use metrics::Metrics;
 
 mod recycler;
 // this is a really unfortunate name for a module
 pub mod futures;
+mod metrics;
 mod ttl_check_inerval;
 
 /// Connection that is idling in the pool.
@@ -44,6 +46,15 @@ struct IdlingConn {
 }
 
 impl IdlingConn {
+    /// Returns true when this connection has a TTL and it elapsed.
+    fn expired(&self) -> bool {
+        self.conn
+            .inner
+            .ttl_deadline
+            .map(|t| Instant::now() > t)
+            .unwrap_or_default()
+    }
+
     /// Returns duration elapsed since this connection is idling.
     fn elapsed(&self) -> Duration {
         self.since.elapsed()
@@ -82,8 +93,11 @@ impl Exchange {
             // Spawn the Recycler.
             tokio::spawn(Recycler::new(pool_opts.clone(), inner.clone(), dropped));
 
-            // Spawn the ttl check interval if `inactive_connection_ttl` isn't `0`
-            if pool_opts.inactive_connection_ttl() > Duration::from_secs(0) {
+            // Spawn the ttl check interval if `inactive_connection_ttl` isn't `0` or
+            // connections have an absolute TTL.
+            if pool_opts.inactive_connection_ttl() > Duration::ZERO
+                || pool_opts.abs_conn_ttl().is_some()
+            {
                 tokio::spawn(TtlCheckInterval::new(pool_opts, inner.clone()));
             }
         }
@@ -92,37 +106,42 @@ impl Exchange {
 
 #[derive(Default, Debug)]
 struct Waitlist {
-    queue: PriorityQueue<QueuedWaker, QueueId>,
+    queue: KeyedPriorityQueue<QueuedWaker, QueueId>,
 }
 
 impl Waitlist {
-    fn push(&mut self, w: Waker, queue_id: QueueId) {
-        self.queue.push(
-            QueuedWaker {
-                queue_id,
-                waker: Some(w),
-            },
-            queue_id,
-        );
+    /// Returns `true` if pushed.
+    fn push(&mut self, waker: Waker, queue_id: QueueId) -> bool {
+        // The documentation of Future::poll says:
+        //   Note that on multiple calls to poll, only the Waker from
+        //   the Context passed to the most recent call should be
+        //   scheduled to receive a wakeup.
+        //
+        // But the the documentation of KeyedPriorityQueue::push says:
+        //   Adds new element to queue if missing key or replace its
+        //   priority if key exists. In second case doesn’t replace key.
+        //
+        // This means we have to remove first to have the most recent
+        // waker in the queue.
+        let occupied = self.remove(queue_id);
+        self.queue.push(QueuedWaker { queue_id, waker }, queue_id);
+        !occupied
     }
 
     fn pop(&mut self) -> Option<Waker> {
         match self.queue.pop() {
-            Some((qw, _)) => Some(qw.waker.unwrap()),
+            Some((qw, _)) => Some(qw.waker),
             None => None,
         }
     }
 
-    fn remove(&mut self, id: QueueId) {
-        let tmp = QueuedWaker {
-            queue_id: id,
-            waker: None,
-        };
-        self.queue.remove(&tmp);
+    /// Returns `true` if removed.
+    fn remove(&mut self, id: QueueId) -> bool {
+        self.queue.remove(&id).is_some()
     }
 
-    fn is_empty(&self) -> bool {
-        self.queue.is_empty()
+    fn peek_id(&mut self) -> Option<QueueId> {
+        self.queue.peek().map(|(qw, _)| qw.queue_id)
     }
 }
 
@@ -142,26 +161,20 @@ impl QueueId {
 #[derive(Debug)]
 struct QueuedWaker {
     queue_id: QueueId,
-    waker: Option<Waker>,
+    waker: Waker,
 }
 
 impl Eq for QueuedWaker {}
 
+impl Borrow<QueueId> for QueuedWaker {
+    fn borrow(&self) -> &QueueId {
+        &self.queue_id
+    }
+}
+
 impl PartialEq for QueuedWaker {
     fn eq(&self, other: &Self) -> bool {
         self.queue_id == other.queue_id
-    }
-}
-
-impl Ord for QueuedWaker {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.queue_id.cmp(&other.queue_id)
-    }
-}
-
-impl PartialOrd for QueuedWaker {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
     }
 }
 
@@ -174,6 +187,7 @@ impl Hash for QueuedWaker {
 /// Connection pool data.
 #[derive(Debug)]
 pub struct Inner {
+    metrics: Arc<Metrics>,
     close: atomic::AtomicBool,
     closed: atomic::AtomicBool,
     exchange: Mutex<Exchange>,
@@ -213,6 +227,7 @@ impl Pool {
             inner: Arc::new(Inner {
                 close: false.into(),
                 closed: false.into(),
+                metrics: Arc::new(Metrics::default()),
                 exchange: Mutex::new(Exchange {
                     available: VecDeque::with_capacity(pool_opts.constraints().max()),
                     waiting: Waitlist::default(),
@@ -224,6 +239,11 @@ impl Pool {
         }
     }
 
+    /// Returns metrics for the connection pool.
+    pub fn metrics(&self) -> Arc<Metrics> {
+        self.inner.metrics.clone()
+    }
+
     /// Creates a new pool of connections.
     pub fn from_url<T: AsRef<str>>(url: T) -> Result<Pool> {
         let opts = Opts::from_str(url.as_ref())?;
@@ -232,7 +252,8 @@ impl Pool {
 
     /// Async function that resolves to `Conn`.
     pub fn get_conn(&self) -> GetConn {
-        GetConn::new(self)
+        let reset_connection = self.opts.pool_opts().reset_connection();
+        GetConn::new(self, reset_connection)
     }
 
     /// Starts a new transaction.
@@ -253,25 +274,6 @@ impl Pool {
     fn return_conn(&mut self, conn: Conn) {
         // NOTE: we're not in async context here, so we can't block or return NotReady
         // any and all cleanup work _has_ to be done in the spawned recycler
-
-        // fast-path for when the connection is immediately ready to be reused
-        if conn.inner.stream.is_some()
-            && !conn.inner.disconnected
-            && !conn.expired()
-            && conn.inner.tx_status == TxStatus::None
-            && !conn.has_pending_result()
-            && !self.inner.close.load(atomic::Ordering::Acquire)
-        {
-            let mut exchange = self.inner.exchange.lock().unwrap();
-            if exchange.available.len() < self.opts.pool_opts().active_bound() {
-                exchange.available.push_back(conn.into());
-                if let Some(w) = exchange.waiting.pop() {
-                    w.wake();
-                }
-                return;
-            }
-        }
-
         self.send_to_recycler(conn);
     }
 
@@ -296,9 +298,17 @@ impl Pool {
     ///
     /// Decreases the exist counter since a broken or dropped connection should not count towards
     /// the total.
-    fn cancel_connection(&self) {
+    pub(super) fn cancel_connection(&self) {
         let mut exchange = self.inner.exchange.lock().unwrap();
         exchange.exist -= 1;
+        self.inner
+            .metrics
+            .create_failed
+            .fetch_add(1, atomic::Ordering::Relaxed);
+        self.inner
+            .metrics
+            .connection_count
+            .store(exchange.exist, atomic::Ordering::Relaxed);
         // we just enabled the creation of a new connection!
         if let Some(w) = exchange.waiting.pop() {
             w.wake();
@@ -307,18 +317,8 @@ impl Pool {
 
     /// Poll the pool for an available connection.
     fn poll_new_conn(
-        self: Pin<&mut Self>,
+        &mut self,
         cx: &mut Context<'_>,
-        queued: bool,
-        queue_id: QueueId,
-    ) -> Poll<Result<GetConnInner>> {
-        self.poll_new_conn_inner(cx, queued, queue_id)
-    }
-
-    fn poll_new_conn_inner(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        queued: bool,
         queue_id: QueueId,
     ) -> Poll<Result<GetConnInner>> {
         let mut exchange = self.inner.exchange.lock().unwrap();
@@ -332,17 +332,48 @@ impl Pool {
 
         exchange.spawn_futures_if_needed(&self.inner);
 
-        // Check if others are waiting and we're not queued.
-        if !exchange.waiting.is_empty() && !queued {
-            exchange.waiting.push(cx.waker().clone(), queue_id);
+        // Check if we are higher priority than anything current
+        let highest = if let Some(cur) = exchange.waiting.peek_id() {
+            queue_id > cur
+        } else {
+            true
+        };
+
+        // If we are not, just queue
+        if !highest {
+            if exchange.waiting.push(cx.waker().clone(), queue_id) {
+                self.inner
+                    .metrics
+                    .active_wait_requests
+                    .fetch_add(1, atomic::Ordering::Relaxed);
+            }
             return Poll::Pending;
         }
 
-        while let Some(IdlingConn { mut conn, .. }) = exchange.available.pop_back() {
+        #[allow(unused_variables)] // `since` is only used when `hdrhistogram` is enabled
+        while let Some(IdlingConn { mut conn, since }) = exchange.available.pop_back() {
             if !conn.expired() {
+                #[cfg(feature = "hdrhistogram")]
+                self.inner
+                    .metrics
+                    .connection_idle_duration
+                    .lock()
+                    .unwrap()
+                    .saturating_record(since.elapsed().as_micros() as u64);
+                #[cfg(feature = "hdrhistogram")]
+                let metrics = self.metrics();
+                conn.inner.active_since = Instant::now();
                 return Poll::Ready(Ok(GetConnInner::Checking(
                     async move {
                         conn.stream_mut()?.check().await?;
+                        #[cfg(feature = "hdrhistogram")]
+                        metrics
+                            .check_duration
+                            .lock()
+                            .unwrap()
+                            .saturating_record(
+                                conn.inner.active_since.elapsed().as_micros() as u64
+                            );
                         Ok(conn)
                     }
                     .boxed(),
@@ -352,25 +383,63 @@ impl Pool {
             }
         }
 
+        self.inner
+            .metrics
+            .connections_in_pool
+            .store(exchange.available.len(), atomic::Ordering::Relaxed);
+
         // we didn't _immediately_ get one -- try to make one
         // we first try to just do a load so we don't do an unnecessary add then sub
         if exchange.exist < self.opts.pool_opts().constraints().max() {
             // we are allowed to make a new connection, so we will!
             exchange.exist += 1;
 
+            self.inner
+                .metrics
+                .connection_count
+                .store(exchange.exist, atomic::Ordering::Relaxed);
+
+            let opts = self.opts.clone();
+            #[cfg(feature = "hdrhistogram")]
+            let metrics = self.metrics();
+
             return Poll::Ready(Ok(GetConnInner::Connecting(
-                Conn::new(self.opts.clone()).boxed(),
+                async move {
+                    let conn = Conn::new(opts).await;
+                    #[cfg(feature = "hdrhistogram")]
+                    if let Ok(conn) = &conn {
+                        metrics
+                            .connect_duration
+                            .lock()
+                            .unwrap()
+                            .saturating_record(
+                                conn.inner.active_since.elapsed().as_micros() as u64
+                            );
+                    }
+                    conn
+                }
+                .boxed(),
             )));
         }
 
         // Polled, but no conn available? Back into the queue.
-        exchange.waiting.push(cx.waker().clone(), queue_id);
+        if exchange.waiting.push(cx.waker().clone(), queue_id) {
+            self.inner
+                .metrics
+                .active_wait_requests
+                .fetch_add(1, atomic::Ordering::Relaxed);
+        }
         Poll::Pending
     }
 
     fn unqueue(&self, queue_id: QueueId) {
         let mut exchange = self.inner.exchange.lock().unwrap();
-        exchange.waiting.remove(queue_id);
+        if exchange.waiting.remove(queue_id) {
+            self.inner
+                .metrics
+                .active_wait_requests
+                .fetch_sub(1, atomic::Ordering::Relaxed);
+        }
     }
 }
 
@@ -398,15 +467,18 @@ impl Drop for Conn {
 #[cfg(test)]
 mod test {
     use futures_util::{
-        future::{join_all, select, select_all, try_join_all},
-        try_join, FutureExt,
+        future::{join_all, select, select_all, try_join_all, Either},
+        poll, try_join, FutureExt,
     };
-    use mysql_common::row::Row;
     use tokio::time::{sleep, timeout};
+    use waker_fn::waker_fn;
 
     use std::{
         cmp::Reverse,
-        task::{RawWaker, RawWakerVTable, Waker},
+        future::Future,
+        pin::pin,
+        sync::{Arc, OnceLock},
+        task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
         time::Duration,
     };
 
@@ -415,7 +487,7 @@ mod test {
         opts::PoolOpts,
         prelude::*,
         test_misc::get_opts,
-        PoolConstraints, TxOpts,
+        PoolConstraints, Row, TxOpts, Value,
     };
 
     macro_rules! conn_ex_field {
@@ -428,6 +500,61 @@ mod test {
         ($pool:expr, $field:tt) => {
             $pool.inner.exchange.lock().unwrap().$field
         };
+    }
+
+    fn pool_with_one_connection() -> Pool {
+        let pool_opts = PoolOpts::new().with_constraints(PoolConstraints::new(1, 1).unwrap());
+        let opts = get_opts().pool_opts(pool_opts.clone());
+        Pool::new(opts)
+    }
+
+    #[tokio::test]
+    async fn should_opt_out_of_connection_reset() -> super::Result<()> {
+        let pool_opts = PoolOpts::new().with_constraints(PoolConstraints::new(1, 1).unwrap());
+        let opts = get_opts().pool_opts(pool_opts.clone());
+
+        let pool = Pool::new(opts.clone());
+
+        let mut conn = pool.get_conn().await.unwrap();
+        assert_eq!(
+            conn.query_first::<Value, _>("SELECT @foo").await?.unwrap(),
+            Value::NULL
+        );
+        conn.query_drop("SET @foo = 'foo'").await?;
+        assert_eq!(
+            conn.query_first::<String, _>("SELECT @foo").await?.unwrap(),
+            "foo",
+        );
+        drop(conn);
+
+        conn = pool.get_conn().await.unwrap();
+        assert_eq!(
+            conn.query_first::<Value, _>("SELECT @foo").await?.unwrap(),
+            Value::NULL
+        );
+        conn.query_drop("SET @foo = 'foo'").await?;
+        conn.reset_connection(false);
+        drop(conn);
+
+        conn = pool.get_conn().await.unwrap();
+        assert_eq!(
+            conn.query_first::<String, _>("SELECT @foo").await?.unwrap(),
+            "foo",
+        );
+        drop(conn);
+        pool.disconnect().await.unwrap();
+
+        let pool = Pool::new(opts.pool_opts(pool_opts.with_reset_connection(false)));
+        conn = pool.get_conn().await.unwrap();
+        conn.query_drop("SET @foo = 'foo'").await?;
+        drop(conn);
+        conn = pool.get_conn().await.unwrap();
+        assert_eq!(
+            conn.query_first::<String, _>("SELECT @foo").await?.unwrap(),
+            "foo",
+        );
+        drop(conn);
+        pool.disconnect().await
     }
 
     #[test]
@@ -461,7 +588,7 @@ mod test {
 
     #[tokio::test]
     async fn should_connect() -> super::Result<()> {
-        let pool = Pool::new(get_opts());
+        let pool = Pool::new(crate::Opts::from(get_opts()));
         pool.get_conn().await?.ping().await?;
         pool.disconnect().await?;
         Ok(())
@@ -491,6 +618,9 @@ mod test {
                 .into_iter()
                 .map(|conn| conn.id())
                 .collect::<Vec<_>>();
+
+            // give some time to reset connections
+            sleep(Duration::from_millis(1000)).await;
 
             // get_conn should work if connection is available and alive
             pool.get_conn().await?;
@@ -526,10 +656,7 @@ mod test {
 
     #[tokio::test]
     async fn should_reuse_connections() -> super::Result<()> {
-        let constraints = PoolConstraints::new(1, 1).unwrap();
-        let opts = get_opts().pool_opts(PoolOpts::default().with_constraints(constraints));
-
-        let pool = Pool::new(opts);
+        let pool = pool_with_one_connection();
         let mut conn = pool.get_conn().await?;
 
         let server_version = conn.server_version();
@@ -561,32 +688,38 @@ mod test {
             }
             drop(tx);
             // see that all the tx's eventually complete
-            while let Some(_) = rx.recv().await {}
+            while (rx.recv().await).is_some() {}
         }
         drop(pool);
     }
 
     #[tokio::test]
     async fn should_start_transaction() -> super::Result<()> {
-        let constraints = PoolConstraints::new(1, 1).unwrap();
-        let opts = get_opts().pool_opts(PoolOpts::default().with_constraints(constraints));
+        let pool = pool_with_one_connection();
 
-        let pool = Pool::new(opts);
-
-        "CREATE TEMPORARY TABLE tmp(id int)".ignore(&pool).await?;
+        "CREATE TABLE IF NOT EXISTS mysql.tmp(id int)"
+            .ignore(&pool)
+            .await?;
+        "DELETE FROM mysql.tmp".ignore(&pool).await?;
 
         let mut tx = pool.start_transaction(TxOpts::default()).await?;
-        tx.exec_batch("INSERT INTO tmp (id) VALUES (?)", vec![(1_u8,), (2_u8,)])
-            .await?;
-        tx.exec_drop("SELECT * FROM tmp", ()).await?;
+        tx.exec_batch(
+            "INSERT INTO mysql.tmp (id) VALUES (?)",
+            vec![(1_u8,), (2_u8,)],
+        )
+        .await?;
+        tx.exec_drop("SELECT * FROM mysql.tmp", ()).await?;
         drop(tx);
         let row_opt = pool
             .get_conn()
             .await?
-            .query_first("SELECT COUNT(*) FROM tmp")
+            .query_first("SELECT COUNT(*) FROM mysql.tmp")
             .await?;
         assert_eq!(row_opt, Some((0u8,)));
-        pool.get_conn().await?.query_drop("DROP TABLE tmp").await?;
+        pool.get_conn()
+            .await?
+            .query_drop("DROP TABLE mysql.tmp")
+            .await?;
         pool.disconnect().await?;
         Ok(())
     }
@@ -657,7 +790,7 @@ mod test {
             let _ = conns.pop();
 
             // then, wait for a bit to let the connection be reclaimed
-            sleep(Duration::from_millis(50)).await;
+            sleep(Duration::from_millis(500)).await;
 
             // now check that we have the expected # of connections
             // this may look a little funky, but think of it this way:
@@ -855,10 +988,7 @@ mod test {
 
     #[tokio::test]
     async fn should_ignore_non_fatal_errors_while_returning_to_a_pool() -> super::Result<()> {
-        let pool_constraints = PoolConstraints::new(1, 1).unwrap();
-        let pool_opts = PoolOpts::default().with_constraints(pool_constraints);
-
-        let pool = Pool::new(get_opts().pool_opts(pool_opts));
+        let pool = pool_with_one_connection();
         let id = pool.get_conn().await?.id();
 
         // non-fatal errors are ignored
@@ -873,10 +1003,7 @@ mod test {
 
     #[tokio::test]
     async fn should_remove_waker_of_cancelled_task() {
-        let pool_constraints = PoolConstraints::new(1, 1).unwrap();
-        let pool_opts = PoolOpts::default().with_constraints(pool_constraints);
-
-        let pool = Pool::new(get_opts().pool_opts(pool_opts));
+        let pool = pool_with_one_connection();
         let only_conn = pool.get_conn().await.unwrap();
 
         let join_handle = tokio::spawn(timeout(Duration::from_secs(1), pool.get_conn()));
@@ -890,6 +1017,13 @@ mod test {
         drop(only_conn);
 
         assert_eq!(0, pool.inner.exchange.lock().unwrap().waiting.queue.len());
+        // metrics should catch up with waiting queue (see #335)
+        assert_eq!(
+            0,
+            pool.metrics()
+                .active_wait_requests
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
     }
 
     #[tokio::test]
@@ -968,6 +1102,146 @@ mod test {
         assert_eq!(QUEUE_END_ID, id);
 
         assert_eq!(0, waitlist.queue.len());
+    }
+
+    #[tokio::test]
+    async fn check_absolute_connection_ttl() -> super::Result<()> {
+        let constraints = PoolConstraints::new(1, 3).unwrap();
+        let pool_opts = PoolOpts::default()
+            .with_constraints(constraints)
+            .with_inactive_connection_ttl(Duration::from_secs(99))
+            .with_ttl_check_interval(Duration::from_secs(1))
+            .with_abs_conn_ttl(Some(Duration::from_secs(2)));
+
+        let pool = Pool::new(get_opts().pool_opts(pool_opts));
+
+        let conn_ttl0 = pool.get_conn().await?;
+        sleep(Duration::from_millis(1000)).await;
+        let conn_ttl1 = pool.get_conn().await?;
+        sleep(Duration::from_millis(1000)).await;
+        let conn_ttl2 = pool.get_conn().await?;
+
+        drop(conn_ttl0);
+        drop(conn_ttl1);
+        drop(conn_ttl2);
+        assert_eq!(ex_field!(pool, exist), 3);
+
+        sleep(Duration::from_millis(1500)).await;
+        assert_eq!(ex_field!(pool, exist), 2);
+
+        sleep(Duration::from_millis(1000)).await;
+        assert_eq!(ex_field!(pool, exist), 1);
+
+        // Go even below min pool size.
+        sleep(Duration::from_millis(1000)).await;
+        assert_eq!(ex_field!(pool, exist), 0);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn save_last_waker() {
+        // Test that if passed multiple wakers, we call the last one.
+
+        let pool = pool_with_one_connection();
+
+        // Get a connection, so we know the next future will be
+        // queued.
+        let conn = pool.get_conn().await.unwrap();
+        let mut pending_fut = pin!(pool.get_conn());
+
+        let build_waker = || {
+            let called = Arc::new(OnceLock::new());
+            let called2 = called.clone();
+            let waker = waker_fn(move || called2.set(()).unwrap());
+            (called, waker)
+        };
+
+        let mut assert_pending = |waker| {
+            let mut context = Context::from_waker(&waker);
+            let p = pending_fut.as_mut().poll(&mut context);
+            assert!(matches!(p, Poll::Pending));
+        };
+
+        let (first_called, waker) = build_waker();
+        assert_pending(waker);
+
+        let (second_called, waker) = build_waker();
+        assert_pending(waker);
+
+        drop(conn);
+
+        while second_called.get().is_none() {
+            assert!(first_called.get().is_none());
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        assert!(first_called.get().is_none());
+    }
+
+    #[tokio::test]
+    async fn check_priorities() -> super::Result<()> {
+        let pool = pool_with_one_connection();
+
+        let queue_len = || {
+            let exchange = pool.inner.exchange.lock().unwrap();
+            exchange.waiting.queue.len()
+        };
+
+        // Get a connection, so we know the next futures will be
+        // queued.
+        let conn = pool.get_conn().await.unwrap();
+
+        #[allow(clippy::async_yields_async)]
+        let get_pending = || async {
+            let fut = async {
+                pool.get_conn().await.unwrap();
+            }
+            .shared();
+            let p = poll!(fut.clone());
+            assert!(matches!(p, Poll::Pending));
+            fut
+        };
+
+        let fut1 = get_pending().await;
+        let fut2 = get_pending().await;
+
+        // Both futures are queued
+        assert_eq!(queue_len(), 2);
+
+        drop(conn); // This will pop fut1 from the queue, making it [2]
+        while queue_len() != 1 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        // We called wake on fut1, and even with the select fut1 will
+        // resolve first
+        let Either::Right((_, fut2)) = select(fut2, fut1).await else {
+            panic!("wrong future");
+        };
+
+        // We dropped the connection of fut1, but very likely hasn't
+        // made it through the recycler yet.
+        assert_eq!(queue_len(), 1);
+
+        let p = poll!(fut2.clone());
+        assert!(matches!(p, Poll::Pending));
+        assert_eq!(queue_len(), 1); // The queue still has fut2
+
+        // The connection will pass by the recycler and unblock fut2
+        // and pop it from the queue.
+        fut2.await;
+        assert_eq!(queue_len(), 0);
+
+        // The recycler is probably not done, so a new future will be
+        // pending.
+        let fut3 = get_pending().await;
+        assert_eq!(queue_len(), 1);
+
+        // It is OK to await it.
+        fut3.await;
+
+        Ok(())
     }
 
     #[cfg(feature = "nightly")]

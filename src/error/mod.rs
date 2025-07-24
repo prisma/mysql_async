@@ -8,7 +8,7 @@
 
 pub use url::ParseError;
 
-mod tls;
+pub mod tls;
 
 use mysql_common::{
     named_params::MixedParamsError, params::MissingNamedParameterError,
@@ -20,6 +20,10 @@ use std::{io, result};
 
 /// Result type alias for this library.
 pub type Result<T> = result::Result<T, Error>;
+
+/// The maximum number of bind variables supported by MySQL.
+/// https://stackoverflow.com/questions/4922345/how-many-bind-variables-can-i-use-in-a-sql-query-in-mysql-5#comment136409462_11131824
+pub(crate) const MAX_STATEMENT_PARAMS: usize = u16::MAX as usize;
 
 /// This type enumerates library errors.
 #[derive(Debug, Error)]
@@ -109,7 +113,7 @@ pub enum DriverError {
     #[error("Error converting from mysql row.")]
     FromRow { row: Row },
 
-    #[error("Missing named parameter `{}'.", String::from_utf8_lossy(&name))]
+    #[error("Missing named parameter `{}'.", String::from_utf8_lossy(name))]
     MissingNamedParam { name: Vec<u8> },
 
     #[error("Named and positional parameters mixed in one statement.")]
@@ -135,7 +139,14 @@ pub enum DriverError {
         required,
         supplied
     )]
-    StmtParamsMismatch { required: u16, supplied: u16 },
+    StmtParamsMismatch { required: u16, supplied: usize },
+
+    #[error(
+        "MySQL supports up to {} parameters but {} was supplied.",
+        MAX_STATEMENT_PARAMS,
+        supplied
+    )]
+    StmtParamsNumberExceedsLimit { supplied: usize },
 
     #[error("Unexpected packet.")]
     UnexpectedPacket { payload: Vec<u8> },
@@ -163,6 +174,9 @@ pub enum DriverError {
 
     #[error("Client asked for SSL but server does not have this capability")]
     NoClientSslFlagFromServer,
+
+    #[error("mysql_clear_password must be enabled on the client side")]
+    CleartextPluginDisabled,
 }
 
 #[derive(Debug, Error)]
@@ -240,7 +254,10 @@ impl From<mysql_common::packets::ServerError<'_>> for ServerError {
         ServerError {
             code: packet.error_code(),
             message: packet.message_str().into(),
-            state: packet.sql_state_str().into(),
+            state: packet
+                .sql_state_ref()
+                .map(|s| s.as_str().into_owned())
+                .unwrap_or_else(|| "HY000".to_owned()),
         }
     }
 }

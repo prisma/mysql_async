@@ -3,3 +3,4 @@ Cargo.lock
 .idea
 mysql_async.iml
 .direnv
+.vscode

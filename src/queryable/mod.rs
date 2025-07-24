@@ -31,7 +31,7 @@ use crate::{
     query::AsQuery,
     queryable::query_result::ResultSetMeta,
     tracing_utils::{LevelInfo, LevelTrace, TracingLevel},
-    BoxFuture, Column, Conn, Params, ResultSetStream, Row,
+    BoxFuture, Column, Conn, Connection, Params, ResultSetStream, Row,
 };
 
 pub mod query_result;
@@ -96,8 +96,7 @@ impl Conn {
     pub(crate) async fn clean_dirty(&mut self) -> Result<()> {
         self.drop_result().await?;
         if self.get_tx_status() == TxStatus::RequiresRollback {
-            self.set_tx_status(TxStatus::None);
-            self.exec_drop("ROLLBACK", ()).await?;
+            self.rollback_transaction().await?;
         }
         Ok(())
     }
@@ -273,7 +272,7 @@ pub trait Queryable: Send {
         async move { self.query_iter(query).await?.drop_result().await }.boxed()
     }
 
-    /// Exectues the given statement for each item in the given params iterator.
+    /// Executes the given statement for each item in the given params iterator.
     ///
     /// It'll prepare `stmt` (once), if necessary.
     fn exec_batch<'a: 'b, 'b, S, P, I>(&'a mut self, stmt: S, params_iter: I) -> BoxFuture<'b, ()>
@@ -283,7 +282,7 @@ pub trait Queryable: Send {
         I::IntoIter: Send,
         P: Into<Params> + Send;
 
-    /// Exectues the given statement and collects the first result set.
+    /// Executes the given statement and collects the first result set.
     ///
     /// It'll prepare `stmt`, if necessary.
     ///
@@ -307,7 +306,7 @@ pub trait Queryable: Send {
         .boxed()
     }
 
-    /// Exectues the given statement and returns the first row of the first result set.
+    /// Executes the given statement and returns the first row of the first result set.
     ///
     /// It'll prepare `stmt`, if necessary.
     ///
@@ -335,7 +334,7 @@ pub trait Queryable: Send {
         .boxed()
     }
 
-    /// Exectues the given stmt and maps each row of the first result set.
+    /// Executes the given stmt and maps each row of the first result set.
     ///
     /// It'll prepare `stmt`, if necessary.
     ///
@@ -367,7 +366,7 @@ pub trait Queryable: Send {
         .boxed()
     }
 
-    /// Exectues the given stmt and folds the first result set to a signel value.
+    /// Executes the given stmt and folds the first result set to a signel value.
     ///
     /// It'll prepare `stmt`, if necessary.
     ///
@@ -399,7 +398,7 @@ pub trait Queryable: Send {
         .boxed()
     }
 
-    /// Exectues the given statement and drops the result.
+    /// Executes the given statement and drops the result.
     fn exec_drop<'a: 'b, 'b, S, P>(&'a mut self, stmt: S, params: P) -> BoxFuture<'b, ()>
     where
         S: StatementLike + 'b,
@@ -538,7 +537,7 @@ impl Queryable for Conn {
 
 impl Queryable for Transaction<'_> {
     fn ping(&mut self) -> BoxFuture<'_, ()> {
-        self.0.ping()
+        self.0.as_mut().ping()
     }
 
     fn query_iter<'a, Q>(
@@ -548,18 +547,18 @@ impl Queryable for Transaction<'_> {
     where
         Q: AsQuery + 'a,
     {
-        self.0.query_iter(query)
+        self.0.as_mut().query_iter(query)
     }
 
     fn prep<'a, Q>(&'a mut self, query: Q) -> BoxFuture<'a, Statement>
     where
         Q: AsQuery + 'a,
     {
-        self.0.prep(query)
+        self.0.as_mut().prep(query)
     }
 
     fn close(&mut self, stmt: Statement) -> BoxFuture<'_, ()> {
-        self.0.close(stmt)
+        self.0.as_mut().close(stmt)
     }
 
     fn exec_iter<'a: 's, 's, Q, P>(
@@ -571,7 +570,7 @@ impl Queryable for Transaction<'_> {
         Q: StatementLike + 'a,
         P: Into<Params>,
     {
-        self.0.exec_iter(stmt, params)
+        self.0.as_mut().exec_iter(stmt, params)
     }
 
     fn exec_batch<'a: 'b, 'b, S, P, I>(&'a mut self, stmt: S, params_iter: I) -> BoxFuture<'b, ()>
@@ -581,13 +580,63 @@ impl Queryable for Transaction<'_> {
         I::IntoIter: Send,
         P: Into<Params> + Send,
     {
-        self.0.exec_batch(stmt, params_iter)
+        self.0.as_mut().exec_batch(stmt, params_iter)
+    }
+}
+
+impl<'c, 't: 'c> Queryable for Connection<'c, 't> {
+    #[inline]
+    fn ping(&mut self) -> BoxFuture<'_, ()> {
+        self.as_mut().ping()
+    }
+
+    #[inline]
+    fn query_iter<'a, Q>(
+        &'a mut self,
+        query: Q,
+    ) -> BoxFuture<'a, QueryResult<'a, 'static, TextProtocol>>
+    where
+        Q: AsQuery + 'a,
+    {
+        self.as_mut().query_iter(query)
+    }
+
+    fn prep<'a, Q>(&'a mut self, query: Q) -> BoxFuture<'a, Statement>
+    where
+        Q: AsQuery + 'a,
+    {
+        self.as_mut().prep(query)
+    }
+
+    fn close(&mut self, stmt: Statement) -> BoxFuture<'_, ()> {
+        self.as_mut().close(stmt)
+    }
+
+    fn exec_iter<'a: 's, 's, Q, P>(
+        &'a mut self,
+        stmt: Q,
+        params: P,
+    ) -> BoxFuture<'s, QueryResult<'a, 'static, BinaryProtocol>>
+    where
+        Q: StatementLike + 'a,
+        P: Into<Params>,
+    {
+        self.as_mut().exec_iter(stmt, params)
+    }
+
+    fn exec_batch<'a: 'b, 'b, S, P, I>(&'a mut self, stmt: S, params_iter: I) -> BoxFuture<'b, ()>
+    where
+        S: StatementLike + 'b,
+        I: IntoIterator<Item = P> + Send + 'b,
+        I::IntoIter: Send,
+        P: Into<Params> + Send,
+    {
+        self.as_mut().exec_batch(stmt, params_iter)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::Queryable;
     use crate::{error::Result, prelude::*, test_misc::get_opts, Conn};
 
     #[tokio::test]

@@ -15,7 +15,7 @@ use std::{
     task::{Context, Poll},
 };
 
-use crate::{buffer_pool::PooledBuf, connection_like::Connection, error::IoError, Conn};
+use crate::{buffer_pool::PooledBuf, connection_like::Connection, error::IoError};
 
 /// Reads a packet.
 #[derive(Debug)]
@@ -27,8 +27,9 @@ impl<'a, 't> ReadPacket<'a, 't> {
         Self(conn.into())
     }
 
-    pub(crate) fn conn_ref(&self) -> &Conn {
-        &*self.0
+    #[cfg(feature = "binlog")]
+    pub(crate) fn conn_ref(&self) -> &crate::Conn {
+        &self.0
     }
 }
 
@@ -36,7 +37,7 @@ impl Future for ReadPacket<'_, '_> {
     type Output = std::result::Result<PooledBuf, IoError>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let packet_opt = match self.0.stream_mut() {
+        let packet_opt = match self.0.as_mut().stream_mut() {
             Ok(stream) => ready!(Pin::new(stream).poll_next(cx)).transpose()?,
             // `ConnectionClosed` error.
             Err(_) => None,
@@ -44,7 +45,7 @@ impl Future for ReadPacket<'_, '_> {
 
         match packet_opt {
             Some(packet) => {
-                self.0.touch();
+                self.0.as_mut().touch();
                 Poll::Ready(Ok(packet))
             }
             None => Poll::Ready(Err(Error::new(

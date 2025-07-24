@@ -7,7 +7,7 @@
 // modified, or distributed except according to those terms.
 
 use lru::LruCache;
-use twox_hash::XxHash;
+use twox_hash::XxHash64;
 
 use std::{
     borrow::Borrow,
@@ -23,13 +23,13 @@ pub struct QueryString(pub Arc<[u8]>);
 
 impl Borrow<[u8]> for QueryString {
     fn borrow(&self) -> &[u8] {
-        &*self.0.as_ref()
+        self.0.as_ref()
     }
 }
 
 impl PartialEq<[u8]> for QueryString {
     fn eq(&self, other: &[u8]) -> bool {
-        &*self.0.as_ref() == other
+        self.0.as_ref() == other
     }
 }
 
@@ -42,7 +42,7 @@ pub struct Entry {
 pub struct StmtCache {
     cap: usize,
     cache: LruCache<u32, Entry>,
-    query_map: HashMap<QueryString, u32, BuildHasherDefault<XxHash>>,
+    query_map: HashMap<QueryString, u32, BuildHasherDefault<XxHash64>>,
 }
 
 impl StmtCache {
@@ -80,7 +80,7 @@ impl StmtCache {
 
         if self.cache.len() > self.cap {
             if let Some((_, entry)) = self.cache.pop_lru() {
-                self.query_map.remove(&*entry.query.0.as_ref());
+                self.query_map.remove(entry.query.0.as_ref());
                 return Some(entry.stmt);
             }
         }

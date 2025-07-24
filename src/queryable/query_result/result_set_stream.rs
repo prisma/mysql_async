@@ -102,6 +102,16 @@ impl<'r, 'a: 'r, 't: 'a, T, P> ResultSetStream<'r, 'a, 't, T, P> {
             .unwrap_or_default()
     }
 
+    /// See [`QueryResult::columns_ref`].
+    pub fn columns_ref(&self) -> &[Column] {
+        &self.columns[..]
+    }
+
+    /// See [`QueryResult::columns`].
+    pub fn columns(&self) -> Arc<[Column]> {
+        self.columns.clone()
+    }
+
     /// See [`Conn::info`][1].
     ///
     /// [1]: crate::Conn::info
@@ -179,7 +189,7 @@ where
     async fn setup_stream(
         &mut self,
     ) -> crate::Result<Option<(Option<OkPacket<'static>>, Arc<[Column]>)>> {
-        match self.conn.use_pending_result()? {
+        match self.conn.as_mut().use_pending_result()? {
             Some(PendingResult::Taken(meta)) => {
                 let meta = (*meta).clone();
                 self.skip_taken(meta).await?;
@@ -189,7 +199,7 @@ where
         }
 
         let ok_packet = self.conn.last_ok_packet().cloned();
-        let columns = match self.conn.take_pending_result()? {
+        let columns = match self.conn.as_mut().take_pending_result()? {
             Some(meta) => meta.columns().clone(),
             None => return Ok(None),
         };
