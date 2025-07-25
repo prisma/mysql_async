@@ -40,11 +40,16 @@ jobs:
         displayName: cargo fmt
       - bash: |
           cargo +nightly build -Zfeatures=dev_dep
-          SSL=false COMPRESS=false cargo test
-          SSL=true COMPRESS=false cargo test
+          SSL=false COMPRESS=false cargo test --features binlog,derive,chrono,time,bigdecimal,rust_decimal,frunk,client_ed25519,tracing
+          SSL=true COMPRESS=false cargo test --features native-tls-tls
           SSL=false COMPRESS=true cargo test
-          SSL=true COMPRESS=true cargo test
-          SSL=true COMPRESS=false cargo test --no-default-features --features default-rustls
+          SSL=true COMPRESS=true cargo test --features rustls-tls,ring
+
+          SSL=true COMPRESS=false cargo check --no-default-features --features default-rustls
+          SSL=true COMPRESS=false cargo check --no-default-features --features default-rustls-ring
+          SSL=true COMPRESS=false cargo check --no-default-features --features minimal
+          SSL=true COMPRESS=false cargo check --no-default-features --features minimal-rust
+          SSL=true COMPRESS=false cargo check --no-default-features --features minimal,tracing
         env:
           RUST_BACKTRACE: 1
           DATABASE_URL: mysql://root:root@127.0.0.1:3306/mysql
@@ -79,9 +84,8 @@ jobs:
         displayName: Install Rust (Windows)
       - bash: |
           SSL=false COMPRESS=false cargo test
-          SSL=true COMPRESS=false cargo test
+          SSL=true COMPRESS=false cargo test --features native-tls-tls
           SSL=false COMPRESS=true cargo test
-          SSL=true COMPRESS=true cargo test
         env:
           RUST_BACKTRACE: 1
           DATABASE_URL: mysql://root:password@127.0.0.1/mysql
@@ -93,10 +97,16 @@ jobs:
     strategy:
       maxParallel: 10
       matrix:
+        v91:
+          DB_VERSION: "9.1"
+        v90:
+          DB_VERSION: "9.0"
+        v84:
+          DB_VERSION: "8.4"
         v80:
-          DB_VERSION: "8-debian"
+          DB_VERSION: "8.0-debian"
         v57:
-          DB_VERSION: "5-debian"
+          DB_VERSION: "5.7-debian"
         v56:
           DB_VERSION: "5.6"
     steps:
@@ -114,17 +124,28 @@ jobs:
         displayName: Run MySql in Docker
       - bash: |
           docker exec container bash -l -c "mysql -uroot -ppassword -e \"SET old_passwords = 1; GRANT ALL PRIVILEGES ON *.* TO 'root2'@'%' IDENTIFIED WITH mysql_old_password AS 'password'; SET PASSWORD FOR 'root2'@'%' = OLD_PASSWORD('password')\"";
+          docker exec container bash -l -c "echo 'deb [trusted=yes] http://archive.debian.org/debian/ stretch main non-free contrib' > /etc/apt/sources.list"
+          docker exec container bash -l -c "echo 'deb-src [trusted=yes] http://archive.debian.org/debian/ stretch main non-free contrib ' >> /etc/apt/sources.list"
+          docker exec container bash -l -c "echo 'deb [trusted=yes] http://archive.debian.org/debian-security/ stretch/updates main non-free contrib' >> /etc/apt/sources.list"
+          docker exec container bash -l -c "echo 'deb [trusted=yes] http://repo.mysql.com/apt/debian/ stretch mysql-5.6' > /etc/apt/sources.list.d/mysql.list"
         condition: eq(variables['DB_VERSION'], '5.6')
       - bash: |
-          docker exec container bash -l -c "apt-get update"
+          docker exec container bash -l -c "apt-get --allow-unauthenticated -y update"
           docker exec container bash -l -c "apt-get install -y curl clang libssl-dev pkg-config build-essential"
           docker exec container bash -l -c "curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain stable"
-        displayName: Install Rust in docker
+        displayName: Install Rust in docker (Debian)
+        condition: or(eq(variables['DB_VERSION'], '5.6'), eq(variables['DB_VERSION'], '5.7-debian'), eq(variables['DB_VERSION'], '8.0-debian'))
+      - bash: |
+          docker exec container bash -l -c "microdnf install dnf"
+          docker exec container bash -l -c "dnf group install \"Development Tools\""
+          docker exec container bash -l -c "curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain stable"
+        displayName: Install Rust in docker (RedHat)
+        condition: not(or(eq(variables['DB_VERSION'], '5.6'), eq(variables['DB_VERSION'], '5.7-debian'), eq(variables['DB_VERSION'], '8.0-debian')))
       - bash: |
           if [[ "5.6" != "$(DB_VERSION)" ]]; then SSL=true; else DATABASE_URL="mysql://root2:password@127.0.0.1/mysql?secure_auth=false"; fi
           docker exec container bash -l -c "cd \$HOME && DATABASE_URL=$DATABASE_URL cargo test"
           docker exec container bash -l -c "cd \$HOME && DATABASE_URL=$DATABASE_URL COMPRESS=true cargo test"
-          docker exec container bash -l -c "cd \$HOME && DATABASE_URL=$DATABASE_URL SSL=$SSL cargo test"
+          docker exec container bash -l -c "cd \$HOME && DATABASE_URL=$DATABASE_URL SSL=$SSL cargo test --features native-tls-tls"
           docker exec container bash -l -c "cd \$HOME && DATABASE_URL=$DATABASE_URL SSL=$SSL COMPRESS=true cargo test"
           docker exec container bash -l -c "cd \$HOME && DATABASE_URL=$DATABASE_URL SSL=$SSL COMPRESS=true cargo test --no-default-features --features default-rustls"
         env:
@@ -138,20 +159,16 @@ jobs:
     strategy:
       maxParallel: 10
       matrix:
-        v107:
-          DB_VERSION: "10.7"
-        v106:
-          DB_VERSION: "10.6"
-        v105:
-          DB_VERSION: "10.5"
-        v104:
-          DB_VERSION: "10.4"
-        v103:
-          DB_VERSION: "10.3"
-        v102:
-          DB_VERSION: "10.2"
-        v101:
-          DB_VERSION: "10.1"
+        v1162:
+          DB_VERSION: "11.6.2"
+        v1152:
+          DB_VERSION: "11.5.2"
+        v1144:
+          DB_VERSION: "11.4.2"
+        v113:
+          DB_VERSION: "11.3.2"
+        v1011:
+          DB_VERSION: "10.11.10"
     steps:
       - bash: |
           sudo apt-get update
@@ -166,6 +183,7 @@ jobs:
           git checkout 901a7de
         displayName: Clone rust-mysql-simple (for ssl certs)
       - bash: |
+          if [[ "11.6.2" == "$(DB_VERSION)" ]]; then ARG=" --plugin-load-add=auth_ed25519"; fi
           docker run --rm -d \
               --name container \
               -v `pwd`:/root \
@@ -180,7 +198,9 @@ jobs:
                   --ssl \
                   --ssl-ca=/root/rust-mysql-simple/tests/ca.crt \
                   --ssl-cert=/root/rust-mysql-simple/tests/server.crt \
-                  --ssl-key=/root/rust-mysql-simple/tests/server-key.pem &
+                  --ssl-key=/root/rust-mysql-simple/tests/server-key.pem \
+                  --secure-auth=OFF \
+                  $ARG &
           while ! nc -W 1 localhost 3307 | grep -q -P '.+'; do sleep 1; done
         displayName: Run MariaDb in Docker
       - bash: |
@@ -189,11 +209,12 @@ jobs:
           docker exec container bash -l -c "curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain stable"
         displayName: Install Rust in docker
       - bash: |
-          docker exec container bash -l -c "cd \$HOME && DATABASE_URL=$DATABASE_URL cargo test"
-          docker exec container bash -l -c "cd \$HOME && DATABASE_URL=$DATABASE_URL COMPRESS=true cargo test"
-          docker exec container bash -l -c "cd \$HOME && DATABASE_URL=$DATABASE_URL SSL=true cargo test"
-          docker exec container bash -l -c "cd \$HOME && DATABASE_URL=$DATABASE_URL SSL=true COMPRESS=true cargo test"
-          if [[ "10.1" != "$(DB_VERSION)" ]]; then docker exec container bash -l -c "cd \$HOME && DATABASE_URL=$DATABASE_URL SSL=true cargo test --no-default-features --features default-rustls"; fi
+          if [[ "11.6.2" == "$(DB_VERSION)" ]]; then FEATURES="client_ed25519"; fi
+          docker exec container bash -l -c "cd \$HOME && DATABASE_URL=$DATABASE_URL cargo test --features $FEATURES"
+          docker exec container bash -l -c "cd \$HOME && DATABASE_URL=$DATABASE_URL COMPRESS=true cargo test --features $FEATURES"
+          docker exec container bash -l -c "cd \$HOME && DATABASE_URL=$DATABASE_URL SSL=true cargo test --features native-tls-tls,$FEATURES"
+          docker exec container bash -l -c "cd \$HOME && DATABASE_URL=$DATABASE_URL SSL=true COMPRESS=true cargo test --features $FEATURES"
+          if [[ "10.1" != "$(DB_VERSION)" ]]; then docker exec container bash -l -c "cd \$HOME && DATABASE_URL=$DATABASE_URL SSL=true cargo test --no-default-features --features default-rustls,$FEATURES"; fi
         env:
           RUST_BACKTRACE: 1
           DATABASE_URL: mysql://root:password@127.0.0.1/mysql
@@ -204,10 +225,14 @@ jobs:
       vmImage: "ubuntu-latest"
     strategy:
       matrix:
-        v5.3.0:
-          DB_VERSION: "v5.3.0"
-        v5.0.6:
-          DB_VERSION: "v5.0.6"
+        v8.5.0:
+          DB_VERSION: "v8.5.0"
+        v7.6.0:
+          DB_VERSION: "v7.6.0"
+        v6.6.0:
+          DB_VERSION: "v6.6.0"
+        v5.4.3:
+          DB_VERSION: "v5.4.3"
     steps:
       - bash: |
           curl --proto '=https' --tlsv1.2 -sSf https://tiup-mirrors.pingcap.com/install.sh | sh

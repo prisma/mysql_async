@@ -11,8 +11,6 @@ pub use self::{read_packet::ReadPacket, write_packet::WritePacket};
 use bytes::BytesMut;
 use futures_core::{ready, stream};
 use mysql_common::proto::codec::PacketCodec as PacketCodecInner;
-use pin_project::pin_project;
-use socket2::{Socket as Socket2Socket, TcpKeepalive};
 #[cfg(unix)]
 use tokio::io::AsyncWriteExt;
 use tokio::{
@@ -31,6 +29,7 @@ use std::{
         ErrorKind::{BrokenPipe, NotConnected, Other},
     },
     mem::replace,
+    net::SocketAddr,
     ops::{Deref, DerefMut},
     pin::Pin,
     task::{Context, Poll},
@@ -40,13 +39,15 @@ use std::{
 use crate::{
     buffer_pool::PooledBuf,
     error::IoError,
-    opts::{HostPortOrUrl, SslOpts, DEFAULT_PORT},
+    opts::{HostPortOrUrl, DEFAULT_PORT},
 };
 
 #[cfg(unix)]
 use crate::io::socket::Socket;
 
 mod tls;
+
+pub(crate) use self::tls::TlsConnector;
 
 macro_rules! with_interrupted {
     ($e:expr) => {
@@ -73,7 +74,7 @@ impl Default for PacketCodec {
     fn default() -> Self {
         Self {
             inner: Default::default(),
-            decode_buf: crate::BUFFER_POOL.get(),
+            decode_buf: crate::buffer_pool().get(),
         }
     }
 }
@@ -98,7 +99,7 @@ impl Decoder for PacketCodec {
 
     fn decode(&mut self, src: &mut BytesMut) -> std::result::Result<Option<Self::Item>, IoError> {
         if self.inner.decode(src, self.decode_buf.as_mut())? {
-            let new_buf = crate::BUFFER_POOL.get();
+            let new_buf = crate::buffer_pool().get();
             Ok(Some(replace(&mut self.decode_buf, new_buf)))
         } else {
             Ok(None)
@@ -114,16 +115,15 @@ impl Encoder<PooledBuf> for PacketCodec {
     }
 }
 
-#[pin_project(project = EndpointProj)]
 #[derive(Debug)]
 pub(crate) enum Endpoint {
     Plain(Option<TcpStream>),
     #[cfg(feature = "native-tls-tls")]
-    Secure(#[pin] tokio_native_tls::TlsStream<TcpStream>),
+    Secure(tokio_native_tls::TlsStream<TcpStream>),
     #[cfg(feature = "rustls-tls")]
-    Secure(#[pin] tokio_rustls::client::TlsStream<tokio::net::TcpStream>),
+    Secure(tokio_rustls::client::TlsStream<tokio::net::TcpStream>),
     #[cfg(unix)]
-    Socket(#[pin] Socket),
+    Socket(Socket),
 }
 
 /// This future will check that TcpStream is live.
@@ -153,12 +153,9 @@ impl Future for CheckTcpStream<'_> {
 }
 
 impl Endpoint {
-    #[cfg(all(any(feature = "native-tls-tls", feature = "rustls-tls"), unix))]
+    #[cfg(unix)]
     fn is_socket(&self) -> bool {
-        match self {
-            Self::Socket(_) => true,
-            _ => false,
-        }
+        matches!(self, Self::Socket(_))
     }
 
     /// Checks, that connection is alive.
@@ -182,7 +179,7 @@ impl Endpoint {
             }
             #[cfg(unix)]
             Endpoint::Socket(socket) => {
-                socket.write(&[]).await?;
+                let _ = socket.write(&[]).await?;
                 Ok(())
             }
             Endpoint::Plain(None) => unreachable!(),
@@ -192,18 +189,6 @@ impl Endpoint {
     #[cfg(any(feature = "native-tls-tls", feature = "rustls-tls"))]
     pub fn is_secure(&self) -> bool {
         matches!(self, Endpoint::Secure(_))
-    }
-
-    #[cfg(all(not(feature = "native-tls"), not(feature = "rustls")))]
-    pub async fn make_secure(
-        &mut self,
-        _domain: String,
-        _ssl_opts: crate::SslOpts,
-    ) -> crate::error::Result<()> {
-        panic!(
-            "Client had asked for TLS connection but TLS support is disabled. \
-            Please enable one of the following features: [\"native-tls-tls\", \"rustls-tls\"]"
-        )
     }
 
     pub fn set_tcp_nodelay(&self, val: bool) -> io::Result<()> {
@@ -256,17 +241,17 @@ impl AsyncRead for Endpoint {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::result::Result<(), tokio::io::Error>> {
-        let mut this = self.project();
+        let this = self.get_mut();
         with_interrupted!(match this {
-            EndpointProj::Plain(ref mut stream) => {
+            Self::Plain(stream) => {
                 Pin::new(stream.as_mut().unwrap()).poll_read(cx, buf)
             }
             #[cfg(feature = "native-tls-tls")]
-            EndpointProj::Secure(ref mut stream) => stream.as_mut().poll_read(cx, buf),
+            Self::Secure(stream) => Pin::new(stream).poll_read(cx, buf),
             #[cfg(feature = "rustls-tls")]
-            EndpointProj::Secure(ref mut stream) => stream.as_mut().poll_read(cx, buf),
+            Self::Secure(stream) => Pin::new(stream).poll_read(cx, buf),
             #[cfg(unix)]
-            EndpointProj::Socket(ref mut stream) => stream.as_mut().poll_read(cx, buf),
+            Self::Socket(stream) => Pin::new(stream).poll_read(cx, buf),
         })
     }
 }
@@ -277,17 +262,17 @@ impl AsyncWrite for Endpoint {
         cx: &mut Context,
         buf: &[u8],
     ) -> Poll<std::result::Result<usize, tokio::io::Error>> {
-        let mut this = self.project();
+        let this = self.get_mut();
         with_interrupted!(match this {
-            EndpointProj::Plain(ref mut stream) => {
+            Self::Plain(stream) => {
                 Pin::new(stream.as_mut().unwrap()).poll_write(cx, buf)
             }
             #[cfg(feature = "native-tls-tls")]
-            EndpointProj::Secure(ref mut stream) => stream.as_mut().poll_write(cx, buf),
+            Self::Secure(stream) => Pin::new(stream).poll_write(cx, buf),
             #[cfg(feature = "rustls-tls")]
-            EndpointProj::Secure(ref mut stream) => stream.as_mut().poll_write(cx, buf),
+            Self::Secure(stream) => Pin::new(stream).poll_write(cx, buf),
             #[cfg(unix)]
-            EndpointProj::Socket(ref mut stream) => stream.as_mut().poll_write(cx, buf),
+            Self::Socket(stream) => Pin::new(stream).poll_write(cx, buf),
         })
     }
 
@@ -295,17 +280,17 @@ impl AsyncWrite for Endpoint {
         self: Pin<&mut Self>,
         cx: &mut Context,
     ) -> Poll<std::result::Result<(), tokio::io::Error>> {
-        let mut this = self.project();
+        let this = self.get_mut();
         with_interrupted!(match this {
-            EndpointProj::Plain(ref mut stream) => {
+            Self::Plain(stream) => {
                 Pin::new(stream.as_mut().unwrap()).poll_flush(cx)
             }
             #[cfg(feature = "native-tls-tls")]
-            EndpointProj::Secure(ref mut stream) => stream.as_mut().poll_flush(cx),
+            Self::Secure(stream) => Pin::new(stream).poll_flush(cx),
             #[cfg(feature = "rustls-tls")]
-            EndpointProj::Secure(ref mut stream) => stream.as_mut().poll_flush(cx),
+            Self::Secure(stream) => Pin::new(stream).poll_flush(cx),
             #[cfg(unix)]
-            EndpointProj::Socket(ref mut stream) => stream.as_mut().poll_flush(cx),
+            Self::Socket(stream) => Pin::new(stream).poll_flush(cx),
         })
     }
 
@@ -313,17 +298,17 @@ impl AsyncWrite for Endpoint {
         self: Pin<&mut Self>,
         cx: &mut Context,
     ) -> Poll<std::result::Result<(), tokio::io::Error>> {
-        let mut this = self.project();
+        let this = self.get_mut();
         with_interrupted!(match this {
-            EndpointProj::Plain(ref mut stream) => {
+            Self::Plain(stream) => {
                 Pin::new(stream.as_mut().unwrap()).poll_shutdown(cx)
             }
             #[cfg(feature = "native-tls-tls")]
-            EndpointProj::Secure(ref mut stream) => stream.as_mut().poll_shutdown(cx),
+            Self::Secure(stream) => Pin::new(stream).poll_shutdown(cx),
             #[cfg(feature = "rustls-tls")]
-            EndpointProj::Secure(ref mut stream) => stream.as_mut().poll_shutdown(cx),
+            Self::Secure(stream) => Pin::new(stream).poll_shutdown(cx),
             #[cfg(unix)]
-            EndpointProj::Socket(ref mut stream) => stream.as_mut().poll_shutdown(cx),
+            Self::Socket(stream) => Pin::new(stream).poll_shutdown(cx),
         })
     }
 }
@@ -360,30 +345,30 @@ impl Stream {
         keepalive: Option<Duration>,
     ) -> io::Result<Stream> {
         let tcp_stream = match addr {
-            HostPortOrUrl::HostPort(host, port) => {
-                TcpStream::connect((host.as_str(), *port)).await?
-            }
+            HostPortOrUrl::HostPort {
+                host,
+                port,
+                resolved_ips,
+            } => match resolved_ips {
+                Some(ips) => {
+                    let addrs = ips
+                        .iter()
+                        .map(|ip| SocketAddr::new(*ip, *port))
+                        .collect::<Vec<_>>();
+                    TcpStream::connect(&*addrs).await?
+                }
+                None => TcpStream::connect((host.as_str(), *port)).await?,
+            },
             HostPortOrUrl::Url(url) => {
                 let addrs = url.socket_addrs(|| Some(DEFAULT_PORT))?;
                 TcpStream::connect(&*addrs).await?
             }
         };
 
+        #[cfg(any(unix, windows))]
         if let Some(duration) = keepalive {
-            #[cfg(unix)]
-            let socket = {
-                use std::os::unix::prelude::*;
-                let fd = tcp_stream.as_raw_fd();
-                unsafe { Socket2Socket::from_raw_fd(fd) }
-            };
-            #[cfg(windows)]
-            let socket = {
-                use std::os::windows::prelude::*;
-                let sock = tcp_stream.as_raw_socket();
-                unsafe { Socket2Socket::from_raw_socket(sock) }
-            };
-            socket.set_tcp_keepalive(&TcpKeepalive::new().with_time(duration))?;
-            std::mem::forget(socket);
+            socket2::SockRef::from(&tcp_stream)
+                .set_tcp_keepalive(&socket2::TcpKeepalive::new().with_time(duration))?;
         }
 
         Ok(Stream {
@@ -404,11 +389,11 @@ impl Stream {
     pub(crate) async fn make_secure(
         &mut self,
         domain: String,
-        ssl_opts: SslOpts,
+        tls_connector: &TlsConnector,
     ) -> crate::error::Result<()> {
         let codec = self.codec.take().unwrap();
         let FramedParts { mut io, codec, .. } = codec.into_parts();
-        io.make_secure(domain, ssl_opts).await?;
+        io.make_secure(domain, tls_connector).await?;
         let codec = Framed::new(io, codec);
         self.codec = Some(Box::new(codec));
         Ok(())
@@ -417,6 +402,11 @@ impl Stream {
     #[cfg(any(feature = "native-tls-tls", feature = "rustls-tls"))]
     pub(crate) fn is_secure(&self) -> bool {
         self.codec.as_ref().unwrap().get_ref().is_secure()
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn is_socket(&self) -> bool {
+        self.codec.as_ref().unwrap().get_ref().is_socket()
     }
 
     pub(crate) fn reset_seq_id(&mut self) {
@@ -455,7 +445,7 @@ impl Stream {
         self.closed = true;
         if let Some(mut codec) = self.codec {
             use futures_sink::Sink;
-            futures_util::future::poll_fn(|cx| match Pin::new(&mut *codec).poll_close(cx) {
+            std::future::poll_fn(|cx| match Pin::new(&mut *codec).poll_close(cx) {
                 Poll::Ready(Err(IoError::Io(err))) if err.kind() == NotConnected => {
                     Poll::Ready(Ok(()))
                 }
@@ -497,7 +487,7 @@ mod test {
             super::Endpoint::Plain(Some(stream)) => stream,
             #[cfg(feature = "rustls-tls")]
             super::Endpoint::Secure(tls_stream) => tls_stream.get_ref().0,
-            #[cfg(feature = "native-tls")]
+            #[cfg(feature = "native-tls-tls")]
             super::Endpoint::Secure(tls_stream) => tls_stream.get_ref().get_ref().get_ref(),
             _ => unreachable!(),
         };

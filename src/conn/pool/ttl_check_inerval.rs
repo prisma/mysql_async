@@ -7,10 +7,10 @@
 // modified, or distributed except according to those terms.
 
 use futures_util::future::{ok, FutureExt};
-use pin_project::pin_project;
 use tokio::time::{self, Interval};
 
 use std::{
+    collections::VecDeque,
     future::Future,
     sync::{atomic::Ordering, Arc},
 };
@@ -25,10 +25,8 @@ use std::pin::Pin;
 /// The purpose of this interval is to remove idling connections that both:
 /// * overflows min bound of the pool;
 /// * idles longer then `inactive_connection_ttl`.
-#[pin_project]
 pub(crate) struct TtlCheckInterval {
     inner: Arc<Inner>,
-    #[pin]
     interval: Interval,
     pool_opts: PoolOpts,
 }
@@ -46,24 +44,48 @@ impl TtlCheckInterval {
 
     /// Perform the check.
     pub fn check_ttl(&self) {
-        let mut exchange = self.inner.exchange.lock().unwrap();
+        let to_be_dropped = {
+            let mut exchange = self.inner.exchange.lock().unwrap();
 
-        let num_idling = exchange.available.len();
-        let num_to_drop = num_idling.saturating_sub(self.pool_opts.constraints().min());
+            let num_to_drop = exchange
+                .available
+                .len()
+                .saturating_sub(self.pool_opts.constraints().min());
 
-        for _ in 0..num_to_drop {
-            let idling_conn = exchange.available.pop_front().unwrap();
-            if idling_conn.elapsed() > self.pool_opts.inactive_connection_ttl() {
-                assert!(idling_conn.conn.inner.pool.is_none());
-                let inner = self.inner.clone();
-                tokio::spawn(idling_conn.conn.disconnect().then(move |_| {
-                    let mut exchange = inner.exchange.lock().unwrap();
-                    exchange.exist -= 1;
-                    ok::<_, ()>(())
-                }));
-            } else {
-                exchange.available.push_back(idling_conn);
+            let mut to_be_dropped = Vec::<_>::with_capacity(exchange.available.len());
+            let mut kept_available =
+                VecDeque::<_>::with_capacity(self.pool_opts.constraints().max());
+
+            while let Some(conn) = exchange.available.pop_front() {
+                if conn.expired()
+                    || (to_be_dropped.len() < num_to_drop
+                        && conn.elapsed() > self.pool_opts.inactive_connection_ttl())
+                {
+                    to_be_dropped.push(conn);
+                } else {
+                    kept_available.push_back(conn);
+                }
             }
+            exchange.available = kept_available;
+            self.inner
+                .metrics
+                .connections_in_pool
+                .store(exchange.available.len(), Ordering::Relaxed);
+            to_be_dropped
+        };
+
+        for idling_conn in to_be_dropped {
+            assert!(idling_conn.conn.inner.pool.is_none());
+            let inner = self.inner.clone();
+            tokio::spawn(idling_conn.conn.disconnect().then(move |_| {
+                let mut exchange = inner.exchange.lock().unwrap();
+                exchange.exist -= 1;
+                inner
+                    .metrics
+                    .connection_count
+                    .store(exchange.exist, Ordering::Relaxed);
+                ok::<_, ()>(())
+            }));
         }
     }
 }
@@ -73,7 +95,7 @@ impl Future for TtlCheckInterval {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         loop {
-            let _ = futures_core::ready!(self.as_mut().project().interval.poll_tick(cx));
+            let _ = futures_core::ready!(Pin::new(&mut self.interval).poll_tick(cx));
             let close = self.inner.close.load(Ordering::Acquire);
 
             if !close {

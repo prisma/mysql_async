@@ -6,7 +6,7 @@ use mysql_common::{packets::ComStmtExecuteRequestBuilder, params::Params};
 #[cfg(feature = "tracing")]
 use tracing::{field, info_span, Level, Span};
 
-use crate::{BinaryProtocol, Conn, DriverError, Statement};
+use crate::{conn::MAX_STATEMENT_PARAMS, BinaryProtocol, Conn, DriverError, Statement};
 
 use super::Routine;
 
@@ -52,15 +52,21 @@ impl Routine<()> for ExecRoutine<'_> {
                             Span::current().record("mysql_async.query.params", ps);
                         }
 
+                        if params.len() > MAX_STATEMENT_PARAMS {
+                            Err(DriverError::StmtParamsNumberExceedsLimit {
+                                supplied: params.len(),
+                            })?
+                        }
+
                         if self.stmt.num_params() as usize != params.len() {
                             Err(DriverError::StmtParamsMismatch {
                                 required: self.stmt.num_params(),
-                                supplied: params.len() as u16,
+                                supplied: params.len(),
                             })?
                         }
 
                         let (body, as_long_data) =
-                            ComStmtExecuteRequestBuilder::new(self.stmt.id()).build(&*params);
+                            ComStmtExecuteRequestBuilder::new(self.stmt.id()).build(params);
 
                         if as_long_data {
                             conn.send_long_data(self.stmt.id(), params.iter()).await?;
@@ -71,14 +77,13 @@ impl Routine<()> for ExecRoutine<'_> {
                         break;
                     }
                     Params::Named(_) => {
-                        if self.stmt.named_params.is_none() {
+                        if self.stmt.named_params.is_empty() {
                             let error = DriverError::NamedParamsForPositionalQuery.into();
                             return Err(error);
                         }
 
                         let named = mem::replace(&mut self.params, Params::Empty);
-                        self.params =
-                            named.into_positional(self.stmt.named_params.as_ref().unwrap())?;
+                        self.params = named.into_positional(&self.stmt.named_params)?;
 
                         continue;
                     }
